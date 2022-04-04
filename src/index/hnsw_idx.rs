@@ -377,6 +377,68 @@ impl<E: node::FloatElement, T: node::IdxType> HNSWIndex<E, T> {
         top_candidates
     }
 
+    fn search_layer_with_filter(
+        &self,
+        root: usize,
+        search_data: &node::Node<E, T>,
+        level: usize,
+        ef: usize,
+        has_deletion: bool,
+        filtered_set: FixedBitSet,
+    ) -> BinaryHeap<Neighbor<E, usize>> {
+        let mut visited_id = FixedBitSet::with_capacity(self._nodes.len());
+        let mut top_candidates: BinaryHeap<Neighbor<E, usize>> = BinaryHeap::new();
+        let mut candidates: BinaryHeap<Neighbor<E, usize>> = BinaryHeap::new();
+        let mut lower_bound: E;
+
+        if !has_deletion || !self.is_deleted(root) {
+            let dist = self.get_distance_from_vec(self.get_data(root), search_data);
+            top_candidates.push(Neighbor::new(root, dist));
+            candidates.push(Neighbor::new(root, -dist));
+            lower_bound = dist;
+        } else {
+            lower_bound = E::max_value(); //max dist in top_candidates
+            candidates.push(Neighbor::new(root, -lower_bound))
+        }
+        visited_id.insert(root);
+
+        while !candidates.is_empty() {
+            let cur_neigh = candidates.peek().unwrap();
+            let cur_dist = -cur_neigh._distance;
+            let cur_id = cur_neigh.idx();
+            candidates.pop();
+            if cur_dist > lower_bound {
+                break;
+            }
+            let cur_neighbors = self.get_neighbor(cur_id, level).read().unwrap();
+            cur_neighbors.iter().for_each(|neigh| {
+                let neigh_id = *neigh;
+                if visited_id.contains(neigh_id) {
+                    return;
+                }
+                visited_id.insert(neigh_id);
+                let dist = self.get_distance_from_vec(self.get_data(*neigh), search_data);
+                if top_candidates.len() < ef || dist < lower_bound {
+                    candidates.push(Neighbor::new(neigh_id, -dist));
+
+                    if !self.is_deleted(neigh_id) && filtered_set.contains(neigh_id) {
+                        top_candidates.push(Neighbor::new(neigh_id, dist))
+                    }
+
+                    if top_candidates.len() > ef {
+                        top_candidates.pop();
+                    }
+
+                    if !top_candidates.is_empty() {
+                        lower_bound = top_candidates.peek().unwrap()._distance;
+                    }
+                }
+            });
+        }
+
+        top_candidates
+    }
+
     // fn search_layer_default(
     //     &self,
     //     root: usize,
@@ -390,6 +452,7 @@ impl<E: node::FloatElement, T: node::IdxType> HNSWIndex<E, T> {
         &self,
         search_data: &node::Node<E, T>,
         k: usize,
+        filtered_set: Option<FixedBitSet>,
     ) -> Result<BinaryHeap<Neighbor<E, usize>>, &'static str> {
         let mut top_candidate: BinaryHeap<Neighbor<E, usize>> = BinaryHeap::new();
         if self._n_constructed_items == 0 {
@@ -430,7 +493,17 @@ impl<E: node::FloatElement, T: node::IdxType> HNSWIndex<E, T> {
             k
         };
 
-        top_candidate = self.search_layer(cur_id, search_data, 0, search_range, self._has_removed);
+        top_candidate = match filtered_set {
+            Some(filter) => self.search_layer_with_filter(
+                cur_id,
+                search_data,
+                0,
+                search_range,
+                self._has_removed,
+                filter,
+            ),
+            None => self.search_layer(cur_id, search_data, 0, search_range, self._has_removed),
+        };
         while top_candidate.len() > k {
             top_candidate.pop();
         }
@@ -597,6 +670,44 @@ impl<E: node::FloatElement, T: node::IdxType> HNSWIndex<E, T> {
         }
         Ok(())
     }
+
+    pub fn idx_search_k_with_filter(
+        &self,
+        item: &node::Node<E, T>,
+        k: usize,
+        filtered_set: Option<FixedBitSet>,
+    ) -> Vec<(usize, E)> {
+        let mut ret: BinaryHeap<Neighbor<E, usize>> =
+            self.search_knn(item, k, filtered_set).unwrap();
+        let mut result_idx: Vec<(usize, E)> = Vec::with_capacity(k);
+        while !ret.is_empty() {
+            let top = ret.peek().unwrap();
+            let top_idx = top.idx();
+            let top_distance = top.distance();
+            ret.pop();
+            result_idx.push((top_idx, top_distance))
+        }
+        result_idx
+    }
+
+    pub fn node_search_k_with_filter(
+        &self,
+        item: &node::Node<E, T>,
+        k: usize,
+        filtered_set: Option<FixedBitSet>,
+    ) -> Vec<(node::Node<E, T>, E)> {
+        let result_idx = self.idx_search_k_with_filter(item, k, filtered_set);
+
+        let mut result: Vec<(node::Node<E, T>, E)> = Vec::with_capacity(k);
+        for i in 0..result_idx.len() {
+            let cur_id = result_idx.len() - i - 1;
+            result.push((
+                *self._nodes[result_idx[cur_id].0].clone(),
+                result_idx[cur_id].1,
+            ));
+        }
+        result
+    }
 }
 
 impl<E: node::FloatElement, T: node::IdxType> ann_index::ANNIndex<E, T> for HNSWIndex<E, T> {
@@ -611,25 +722,9 @@ impl<E: node::FloatElement, T: node::IdxType> ann_index::ANNIndex<E, T> for HNSW
         true
     }
 
+    #[inline]
     fn node_search_k(&self, item: &node::Node<E, T>, k: usize) -> Vec<(node::Node<E, T>, E)> {
-        let mut ret: BinaryHeap<Neighbor<E, usize>> = self.search_knn(item, k).unwrap();
-        let mut result: Vec<(node::Node<E, T>, E)> = Vec::with_capacity(k);
-        let mut result_idx: Vec<(usize, E)> = Vec::with_capacity(k);
-        while !ret.is_empty() {
-            let top = ret.peek().unwrap();
-            let top_idx = top.idx();
-            let top_distance = top.distance();
-            ret.pop();
-            result_idx.push((top_idx, top_distance))
-        }
-        for i in 0..result_idx.len() {
-            let cur_id = result_idx.len() - i - 1;
-            result.push((
-                *self._nodes[result_idx[cur_id].0].clone(),
-                result_idx[cur_id].1,
-            ));
-        }
-        result
+        self.node_search_k_with_filter(item, k, None)
     }
 
     fn name(&self) -> &'static str {
